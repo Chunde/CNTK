@@ -13,35 +13,61 @@ namespace Microsoft { namespace MSR { namespace CNTK {
 
 using namespace std;
 
-// TODO: this should be handled by the memory provider
+// Resizing the buffer with the current memory provider.
 void PackerBase::StreamBuffer::Resize(size_t newSize)
 {
     m_size = newSize;
-    m_data.reset(reinterpret_cast<char*>(m_memoryProvider->Alloc(1, newSize)),
-        [this](char* p)
+    auto provider = m_memoryProvider;
+    m_data.reset(reinterpret_cast<char*>(provider->Alloc(1, newSize)),
+        [provider](char* p)
     {
-        m_memoryProvider->Free(p);
+        provider->Free(p);
     });
 }
 
-PackerBase::PackerBase(MemoryProviderPtr memoryProvider,
-    TransformerPtr transformer,
-    size_t minibatchSize,
-    const std::vector<StreamDescriptionPtr>& streams) :
-    m_transformer(transformer),
-    m_minibatchSize(minibatchSize),
-    m_outputStreamDescriptions(streams)
+void PackerBase::SetConfiguration(const ReaderConfiguration& config, const std::vector<MemoryProviderPtr>& memoryProviders)
 {
-    m_inputStreamDescriptions = m_transformer->GetStreamDescriptions();
+    // Let's check that memory providers did not change at the start of new epoch.
+    bool equalMemoryProviders = m_memoryProviders.size() == memoryProviders.size() &&
+        std::equal(memoryProviders.begin(), memoryProviders.end(), m_memoryProviders.begin());
+
+    if (!equalMemoryProviders)
+    {
+        // If they change we have to reinitialize the buffers with the new memory providers, one per stream.
+        m_memoryProviders = memoryProviders;
+
+        if (memoryProviders.size() != m_outputStreamDescriptions.size())
+            RuntimeError("Number of streams does not match the number of memory providers.");
+
+        m_streamBuffers.resize(m_numberOfBuffers);
+        for (size_t i = 0; i < m_numberOfBuffers; ++i)
+        {
+            auto& currentBuffer = m_streamBuffers[i];
+            currentBuffer.reserve(m_outputStreamDescriptions.size());
+            for (size_t j = 0; j < m_outputStreamDescriptions.size(); ++j)
+                currentBuffer.push_back(StreamBuffer(memoryProviders[j]));
+        }
+    }
+
+    m_config = config;
+    if (m_config.m_minibatchSizeInSamples == 0)
+        LogicError("Minibatch size cannot be zero.");
+}
+
+PackerBase::PackerBase(SequenceEnumeratorPtr sequenceEnumerator,
+    const std::vector<StreamDescriptionPtr>& streams,
+    size_t numberOfBuffers) :
+    m_sequenceEnumerator(sequenceEnumerator),
+    m_outputStreamDescriptions(streams),
+    m_numberOfBuffers(numberOfBuffers),
+    m_currentBufferIndex(0)
+{
+    assert(m_numberOfBuffers >= 1);
+    m_inputStreamDescriptions = sequenceEnumerator->GetStreamDescriptions();
     assert(m_inputStreamDescriptions.size() != 0);
     assert(m_inputStreamDescriptions.size() == m_outputStreamDescriptions.size());
 
-    if (m_minibatchSize == 0)
-    {
-        LogicError("Minibatch size cannot be zero.");
-    }
-
-    m_streamBuffers.reserve(m_outputStreamDescriptions.size());
+    m_checkSampleShape.resize(m_outputStreamDescriptions.size(), false);
 
     // Sanity checks:
     for (size_t i = 0; i < m_outputStreamDescriptions.size(); ++i)
@@ -49,11 +75,28 @@ PackerBase::PackerBase(MemoryProviderPtr memoryProvider,
         const auto& stream = m_outputStreamDescriptions[i];
         UNUSED(stream);
 
+        // Check the input.
+        if(m_inputStreamDescriptions[i]->m_elementType != ElementType::tdouble &&
+            m_inputStreamDescriptions[i]->m_elementType != ElementType::tfloat)
+        {
+            RuntimeError("Please specify the type of the '%ls' stream. You can use 'Cast' transform for that.", m_inputStreamDescriptions[i]->m_name.c_str());
+        }
+
         // Input and output should match in everything except for sparse/dense storage type.
         assert(stream->m_elementType == ElementType::tfloat || stream->m_elementType == ElementType::tdouble);
         assert(stream->m_name == m_inputStreamDescriptions[i]->m_name);
         assert(stream->m_id == m_inputStreamDescriptions[i]->m_id);
-        assert(GetSampleSize(m_inputStreamDescriptions[i]) == GetSampleSize(stream));
+
+        if (m_inputStreamDescriptions[i]->m_sampleLayout == nullptr)
+        {
+            // Have to check shapes for each and every sequence.
+            m_checkSampleShape[i] = true;
+        }
+        // Shape the same for complete stream, checking only input/output stream shape.
+        else if (GetSampleSize(m_inputStreamDescriptions[i]) != GetSampleSize(stream))
+        {
+            RuntimeError("Packer cannot unify samples of different dimensions for stream '%ls'.", m_inputStreamDescriptions[i]->m_name.c_str());
+        }
 
         if (m_inputStreamDescriptions[i]->m_storageType == StorageType::dense &&
             stream->m_storageType == StorageType::sparse_csc)
@@ -61,8 +104,6 @@ PackerBase::PackerBase(MemoryProviderPtr memoryProvider,
             RuntimeError("Dense to sparse re-packing requested for stream '%ls' is not supported.",
                 stream->m_name.c_str());
         }
-
-        m_streamBuffers.push_back(StreamBuffer(memoryProvider));
     }
 }
 

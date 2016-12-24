@@ -18,11 +18,12 @@ namespace Microsoft { namespace MSR { namespace CNTK {
 enum class ConvolutionEngineKind
 {
     None      = 0,
-    Reference = 1,
-    CuDnn     = 1 << 1,
-    Legacy    = 1 << 2,
+    Reference = 1,      // Reference, lookup-based implementation. Very slow but works for any convo configuration.
+    CuDnn     = 1 << 1, // cuDNN, works only for 2D/3D convos with full sharing.
+    Legacy    = 1 << 2, // Legacy, for backwards compatibility. REVIEW alexeyk: implement sparse version and remove Legacy altogether.
+    Gemm      = 1 << 3, // Uses convolution unrolling+GEMM technique. Works only for convos with full sharing.
 
-    All     = Reference | CuDnn | Legacy
+    All       = Reference | CuDnn | Legacy | Gemm
 };
 
 enum class PoolKind
@@ -46,20 +47,32 @@ public:
 
     void Forward(const Mat& in, const Mat& kernel, Mat& out, Mat& workspace);
 
-    void BackwardData(const Mat& srcGrad, const Mat& kernel, Mat& grad, Mat& workspace);
+    void BackwardData(const Mat& srcGrad, const Mat& kernel, Mat& grad, bool accumulateGradient, Mat& workspace);
 
-    void BackwardKernel(const Mat& srcGrad, const Mat& in, Mat& kernelGrad, bool allowReuse, Mat& workspace);
+    void BackwardKernel(const Mat& srcGrad, const Mat& in, Mat& kernelGrad, bool accumulateGradient, bool allowReuse, Mat& workspace);
 
     void ForwardPooling(const Mat& in, Mat& out);
 
     void BackwardPooling(const Mat& out, const Mat& srcGrad, const Mat& in, Mat& grad);
 
+    void MaxUnpooling(const Mat& out, const Mat& poolIn, Mat& in);
+
     std::shared_ptr<const ConvolveGeometry> Geometry() const { return m_geometry; }
 
-    static std::unique_ptr<ConvolutionEngine<ElemType>> Create(ConvolveGeometryPtr geometry, DEVICEID_TYPE deviceId, ImageLayoutKind imageLayout,
-                                                               size_t maxTempMemSizeInSamples, PoolKind poolKind = PoolKind::None, ConvolutionEngineKind enabledEngines = ConvolutionEngineKind::All);
+    static std::unique_ptr<ConvolutionEngine<ElemType>> Create(ConvolveGeometryPtr geometry, DEVICEID_TYPE deviceId, 
+                                                               ImageLayoutKind imageLayout, size_t maxTempMemSizeInSamples, PoolKind poolKind = PoolKind::None,
+                                                               ConvolutionEngineKind enabledEngines = ConvolutionEngineKind::All,
+                                                               std::wstring logPrefix = L"", bool forceDeterministicAlgorithms = false);
 
     DISABLE_COPY_AND_MOVE(ConvolutionEngine);
+
+    // REVIEW alexeyk: This is not enough as there should be invalidation of auto-tuner state in cuDNN engine. Fine for now if it works.
+    void SetmMaxTempMemSizeInSamples(const size_t maxTempMemSizeInSamples)
+    {
+        m_maxTempMemSizeInSamples = maxTempMemSizeInSamples;
+    }
+
+    virtual bool ImplementsGradientOverwriteOptimization() const { return false; }
 
 protected:
     ConvolutionEngine(ConvolveGeometryPtr geometry, DEVICEID_TYPE deviceId, ImageLayoutKind imageLayout, size_t maxTempMemSizeInSamples, PoolKind poolKind)
@@ -74,15 +87,17 @@ protected:
 
     virtual void ForwardCore(const Mat& in, const Mat& kernel, Mat& out, Mat& workspace) = 0;
 
-    virtual void BackwardDataCore(const Mat& srcGrad, const Mat& kernel, Mat& grad, Mat& workspace) = 0;
+    virtual void BackwardDataCore(const Mat& srcGrad, const Mat& kernel, Mat& grad, bool accumulateGradient, Mat& workspace) = 0;
 
-    virtual void BackwardKernelCore(const Mat& srcGrad, const Mat& in, Mat& kernelGrad, bool allowReuse, Mat& workspace) = 0;
+    virtual void BackwardKernelCore(const Mat& srcGrad, const Mat& in, Mat& kernelGrad, bool accumulateGradient, bool allowReuse, Mat& workspace) = 0;
 
     virtual void EnsurePoolingInitialized() = 0;
 
     virtual void ForwardPoolingCore(const Mat& in, Mat& out) = 0;
 
     virtual void BackwardPoolingCore(const Mat& out, const Mat& srcGrad, const Mat& in, Mat& grad) = 0;
+
+    virtual void MaxUnpoolingCore(const Mat& out, const Mat& poolIn, Mat& in) = 0;
 
 protected:
     ConvolveGeometryPtr m_geometry;

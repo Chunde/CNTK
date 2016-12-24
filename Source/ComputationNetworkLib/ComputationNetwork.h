@@ -50,14 +50,16 @@ public:
 
     ComputationNetwork() :
         m_randomSeedOffset(0),
-          m_isCompiled(false),
-          m_areMatricesAllocated(false),
-        m_pMBLayoutOfNetwork(make_shared<MBLayout>()),
+        m_isCompiled(false),
+        m_areMatricesAllocated(false),
+        m_pMBLayoutOfNetwork(make_shared<MBLayout>(1, 0, L"*")),
         m_environment(make_shared<ComputationEnvironment>())
     {
+        //m_pMBLayoutOfNetwork->SetAxisName(L"T");
     }
-    ComputationNetwork(DEVICEID_TYPE deviceId)
-        : ComputationNetwork()
+
+    ComputationNetwork(DEVICEID_TYPE deviceId) :
+        ComputationNetwork()
     {
         SetDeviceId(deviceId);
     }
@@ -80,6 +82,7 @@ public:
 
 protected:
     void ConstructFromRoots(DEVICEID_TYPE deviceId, std::deque<ComputationNodeBasePtr>&& roots, const map<ComputationNodeBasePtr, ComputationNodeBasePtr>& replacements);
+    void ProcessSpecialNodes(const ScriptableObjects::IConfigRecord& config, std::deque<ComputationNodeBasePtr>& roots);
 
 public:
     // -----------------------------------------------------------------------
@@ -148,6 +151,8 @@ public:
     {
         VerifyIsCompiled("StartEvaluateMinibatchLoop");
         ResetEvalTimeStamps(); // invalidate all m_value fields  --TODO: redundant (called over again for every root node). Make this private and only call for sets of nodes.
+        for (auto& node : GetEvalOrder(rootNode))
+            node->OnEpochStart();
     }
     template <class NODESET>
     void StartEvaluateMinibatchLoop(const NODESET& nodes) // (ugly name; meant to be unique so we can rename if needed)
@@ -173,6 +178,7 @@ private:
     size_t ValidateNodes(list<ComputationNodeBasePtr> nodes, bool isFirstPass, bool isFinalValidationPass);
     bool ValidateNode(ComputationNodeBasePtr node, bool isFinalValidationPass) const;
     void MarkValueNonSharableNodes();
+    void ChangeNodeInputs(ComputationNodeBasePtr fromNode, ComputationNodeBasePtr toNode);
 
 private:
     void DetermineSetOfAllRoots();
@@ -185,7 +191,11 @@ private:
 public:
     void AllocateAllMatrices(const std::vector<ComputationNodeBasePtr>& evalRootNodes, const std::vector<ComputationNodeBasePtr>& outValueRootNodes, ComputationNodeBasePtr trainRootNode);
 
+    // From the set of nodes extract all nodes which are used as accumulator nodes.
+    std::set<ComputationNodeBasePtr> ExtractNodesWhichAccumulateResult(std::set<ComputationNodeBasePtr> nodes);
+
 private:
+    void PrintMemorySharingStructure(const std::vector<ComputationNodeBasePtr>& nodes);
     void ReleaseMatricesAfterEvalForChildren(ComputationNodeBasePtr n, std::unordered_map<ComputationNodeBasePtr, int>& parentCount);
     void AllocateGradientMatricesForInputs(ComputationNodeBasePtr parentNode);
 
@@ -253,13 +263,20 @@ public:
         m_evalOrders[rootNode] = nodes;
     }
 
+    bool EvalOrderExists(const ComputationNodeBasePtr& rootNode) const
+    {
+        return m_evalOrders.find(rootNode) != m_evalOrders.end();
+    }
+
     // get depth-first traversal order
     // TODO: This is currently not immutable because it gets patched w.r.t. recurrent loops. Ideally we don't patch. Need to review and verify that it is sufficient.
     const std::list<ComputationNodeBasePtr>& GetEvalOrder(const ComputationNodeBasePtr& rootNode) const
     {
         auto iter = m_evalOrders.find(rootNode);
         if (iter == m_evalOrders.end())
+        {
             LogicError("GetEvalOrder: Called without prior call to FormEvalOrder() for %ls %ls operation", rootNode->NodeName().c_str(), rootNode->OperationName().c_str());
+        }
         return iter->second;
     }
 
@@ -288,6 +305,8 @@ public:
     // This returns max number of columns over the feature nodes.
     // Note that if we have multiple slices, MB size != #frames.
     // BUGBUG: This will break once we have inconsistent layouts.
+    // BUGBUG: The number computed here is completely off (it the layout has gaps
+    // they will also be counted towards the actualMBSize)
     size_t DetermineActualMBSizeFromFeatures() const
     {
         size_t actualMBSize = 0;
@@ -325,14 +344,18 @@ public:
     // node construction
     // -----------------------------------------------------------------------
 
-    // non-static version needed because it accesses m_randomSeedOffset
-    // Excessively used by SimpleNetworkBuilder, but always after CreateLearnableParameter(), so we should really absorb it there
-    template <class ElemType>
+    // this function is only for use by NDL (deprecated)
     void InitLearnableParameters(const ComputationNodeBasePtr& node,
-                                 const bool uniformInit,
-                                 const unsigned long randomSeed,
-                                 const ElemType initValueScale,
-                                 bool initOnCPUOnly = false);
+                                 const wchar_t* initString, // "uniform"|"gaussian"|"fixedValue"
+                                 double initValue,          //  scale   | scale    | value
+                                 unsigned long randomSeed = 0,
+                                 bool initOnCPUOnly = false) const;
+    // non-static version needed because it accesses m_randomSeedOffset
+    // Legacy version that is for random only.
+    void RandomInitLearnableParameters(const ComputationNodeBasePtr& node, const bool uniformInit, const unsigned long randomSeed, const double initValueScale, bool initOnCPUOnly = false) const;
+
+    template <class ElemType>
+    void InitLearnableParametersWithBilinearFill(const ComputationNodeBasePtr& node, size_t kernelWidth, size_t kernelHeight);
 
     template <typename N>
     static shared_ptr<N> AsNodePtr(const ComputationNodeBasePtr& inode)
@@ -355,7 +378,8 @@ public:
     void RenameNode(const std::wstring& nodeNameOrig, const std::wstring& nodeNameNew);
     void RenameNode(ComputationNodeBasePtr node, const std::wstring& newNodeName);
     void DeleteNode(const std::wstring& nodeName);
-    void ChangeNode(wstring nodeName, ComputationNodeBasePtr newNode);
+    void ReplaceNode(wstring nodeName, ComputationNodeBasePtr newNode);
+    void InsertNode(wstring nodeName, ComputationNodeBasePtr newNode, const std::set<std::wstring>& newNodeTags);
     void ReplaceLeafNode(wstring oldNodeName, ComputationNodeBasePtr newNode);
     void ReplaceFinalCriterionNode(wstring oldNodeName, ComputationNodeBasePtr newNode);
     void AddFeatureNode(ComputationNodeBasePtr featureNode);
@@ -423,8 +447,11 @@ public:
 
     // TODO: Why are all these static, but then take a network as the first argument? --> make them class members
     template <class ElemType>
-    static void SetDropoutRate(ComputationNetworkPtr net, const ComputationNodeBasePtr& criterionNode, const double dropoutRate, double& prevDropoutRate, unsigned long& dropOutSeed);
+    static void SetDropoutRate(ComputationNetworkPtr net, const ComputationNodeBasePtr& criterionNode, const double dropoutRate, double& prevDropoutRate);
 
+    template <class ElemType>
+    static void SetIRngUserSeed(ComputationNetworkPtr net, const ComputationNodeBasePtr& criterionNode, size_t randSeedBase);
+    
     template <class ElemType>
     static void SetBatchNormalizationTimeConstants(ComputationNetworkPtr net, const ComputationNodeBasePtr& criterionNode, 
                                                    double normalizationTimeConstant, double& prevNormalizationTimeConstant,
@@ -465,13 +492,57 @@ public:
         return iter->second;
     }
 
-    inline std::vector<ComputationNodeBasePtr> CriterionNodesFrom(const wstring& criterionNodeName)
+    inline const std::vector<ComputationNodeBasePtr>& CriterionNodesFrom(const wstring& criterionNodeName)
     {
         ComputationNodeBasePtr node = GetNodeFromName(criterionNodeName);
         if (node->HasMBLayout() || node->GetSampleLayout().GetNumElements() != 1)
             InvalidArgument("%ls %ls operation is not a valid training or eval criterion node.", node->NodeName().c_str(), node->OperationName().c_str());
-        return std::vector<ComputationNodeBasePtr>{node};
+        m_namedCriterionNodes[criterionNodeName] = std::vector<ComputationNodeBasePtr>{node};
+        return m_namedCriterionNodes[criterionNodeName];
     }
+
+    std::vector<ComputationNodeBasePtr> OutputNodesByName(const std::vector<std::wstring>& outputNodeNames) 
+    {
+        std::vector<ComputationNodeBasePtr> outputNodes;
+
+        if (outputNodeNames.size() == 0)
+        {
+            if (OutputNodes().size() == 0)
+                RuntimeError("There is no default output node specified in the network.");
+
+            outputNodes = OutputNodes();
+        }
+        else
+        {
+            for (int i = 0; i < outputNodeNames.size(); i++)
+                outputNodes.push_back(GetNodeFromName(outputNodeNames[i]));
+        }
+
+        return outputNodes;
+    }
+
+    // Collect all input nodes that outputNodes depend on.
+    std::vector<ComputationNodeBasePtr> InputNodesForOutputs(const std::vector<std::wstring>& outputNodeNames)
+    {
+        // use set to remove duplicated items
+        auto outputNodes = OutputNodesByName(outputNodeNames);
+
+        std::set<ComputationNodeBasePtr> inputNodesMap;
+        for (auto& onode : outputNodes)
+        {
+            for (auto& inode : InputNodes(onode))
+                inputNodesMap.insert(inode);
+        }
+
+        std::vector<ComputationNodeBasePtr> inputNodes;
+        for (auto& inode : inputNodesMap)
+            inputNodes.push_back(inode);
+
+        return inputNodes;
+    }
+
+
+    const std::vector<ComputationNodeBasePtr>& RootNodes()           const { return m_allRoots; }
 
     // these are specified as such by the user
     const std::vector<ComputationNodeBasePtr>& FeatureNodes()        const { return m_featureNodes   ; }
@@ -496,6 +567,8 @@ public:
     // add a node to a node group
     void AddToNodeGroup(const std::wstring& groupTag, const ComputationNodeBasePtr& node)
     {
+        assert(node);
+
         // determine the node group by its group tag string
         auto& nodeGroup = GetNodeGroup(groupTag);
         // if node is already in the list then we are done
@@ -563,18 +636,41 @@ public:
         return parents;
     }
 
-    std::list<ComputationNodeBasePtr> GetNodesWithType(const wstring typeName, const ComputationNodeBasePtr& rootNode = nullptr)
+    // Return set of immediate output (parent) nodes for given input (child) node
+    // TODO: there should be a map from output nodes to inputs, so that this operation doesn't take square time
+    std::vector<ComputationNodeBasePtr> GetParentNodes(const std::wstring& inputNodeName)
     {
-        std::list<ComputationNodeBasePtr> nodesWithType;
+        std::set<ComputationNodeBasePtr> outputNodes;
+        for (const auto& iter : m_nameToNodeMap)
+        {
+            const auto& node = iter.second;
+
+            //Iterate over inputs of this node
+            for (const auto& inputNode : node->GetInputs())
+            {
+                if (inputNode->GetName() == inputNodeName)
+                {
+                    outputNodes.insert(node);
+                }
+            }
+        }
+
+        return std::vector<ComputationNodeBasePtr>(outputNodes.begin(), outputNodes.end());
+    }
+
+    std::list<ComputationNodeBasePtr> GetNodesWhere(std::function<bool(const ComputationNodeBasePtr&)>& predicate, const ComputationNodeBasePtr& rootNode = nullptr) const
+    {
+        std::list<ComputationNodeBasePtr> filteredNodes;
 
         // find nodes from all available nodes
+        // TODO: This distinction should not be necessary anymore. Calling GetEvalOrder(nullptr) will have the same effect.
         if (rootNode == nullptr)
         {
             for (auto nodeIter = m_nameToNodeMap.begin(); nodeIter != m_nameToNodeMap.end(); nodeIter++)
             {
                 ComputationNodeBasePtr node = nodeIter->second;
-                if (node->OperationName() == typeName)
-                    nodesWithType.push_back(node);
+                if (predicate(node))
+                    filteredNodes.push_back(node);
             }
         }
         else
@@ -582,12 +678,56 @@ public:
             // for calculating a specific node
             for (const auto& node : GetEvalOrder(rootNode)) // TODO: verify that no use of this requires the actual eval order, then change to GetAllNodesForRoot()
             {
-                if (node->OperationName() == typeName)
-                    nodesWithType.push_back(node);
+                if (predicate(node))
+                    filteredNodes.push_back(node);
             }
         }
 
-        return nodesWithType;
+        return filteredNodes;
+    }
+
+    std::list<ComputationNodeBasePtr> GetNodesWithType(const wstring typeName, const ComputationNodeBasePtr& rootNode = nullptr) const
+    {
+        std::function<bool(const ComputationNodeBasePtr&)> predicate = [typeName](const ComputationNodeBasePtr& node) { return node->OperationName() == typeName; };
+        return GetNodesWhere(predicate, rootNode);
+    }
+
+    // Get the eval nodes with names
+    // if evalNodeNames are not specified, return all the default evalnodes and training criterion nodes.
+    std::vector<ComputationNodeBasePtr> GetEvalNodesWithName(const std::vector<wstring> evalNodeNames)
+    {
+        // determine nodes to evaluate
+        std::vector<ComputationNodeBasePtr> evalNodes;
+
+        set<ComputationNodeBasePtr> criteriaLogged; // (keeps track ot duplicates to avoid we don't double-log critera)
+        if (evalNodeNames.size() == 0)
+        {
+            fprintf(stderr, "evalNodeNames are not specified, using all the default evalnodes and training criterion nodes.\n");
+            if (EvaluationNodes().empty() && FinalCriterionNodes().empty())
+                InvalidArgument("There is no default evaluation node or training criterion specified in the network.");
+
+            for (const auto& node : EvaluationNodes())
+                if (criteriaLogged.insert(node).second)
+                    evalNodes.push_back(node);
+
+            for (const auto& node : FinalCriterionNodes())
+                if (criteriaLogged.insert(node).second)
+                    evalNodes.push_back(node);
+        }
+        else
+        {
+            for (int i = 0; i < evalNodeNames.size(); i++)
+            {
+                const auto& node = GetNodeFromName(evalNodeNames[i]);
+                if (!criteriaLogged.insert(node).second)
+                    continue;
+                if (node->GetSampleLayout().GetNumElements() != 1)
+                    InvalidArgument("Criterion nodes to evaluate must have dimension 1x1.");
+                evalNodes.push_back(node);
+            }
+        }
+
+        return evalNodes;
     }
 
 public:
@@ -680,7 +820,7 @@ public:
         while (!result.second/*if already there*/ && result.first->second != node)
         {
             if (!makeUniqueName || node->NodeName().find_first_of(L".[]") == wstring::npos)
-                RuntimeError("AddNodeToNetIfNotYet: Duplicated name for %ls %ls operation.", node->NodeName().c_str(), node->OperationName().c_str());
+                RuntimeError("AddNodeToNetIfNotYet: Duplicated name for %ls %ls operation (%d vs. %d).", node->NodeName().c_str(), node->OperationName().c_str(), (int)node->m_uniqueNumericId, (int)result.first->second->m_uniqueNumericId);
             node->SetName(L"_" + node->NodeName());
             result = m_nameToNodeMap.insert(make_pair(node->NodeName(), node));
         }
@@ -703,10 +843,9 @@ public:
     // evaluation
     // -----------------------------------------------------------------------
 
-    // zeroes out all gradients except the root itself
-    // TODO: why not the root?
+    // zeroes out all gradients except the root itself (since its gradient is set from outside rather than propagated down)
     // (Note that inside the nodes this only really sets a flag to do it later when needed, but that's not our concern.)
-    void ZeroGradients(const ComputationNodeBasePtr& rootNode)
+    void ZeroInputGradients(const ComputationNodeBasePtr& rootNode)
     {
         for (auto& node : GetAllNodesForRoot(rootNode))
             node->ZeroGradientsOfInputs();
@@ -720,6 +859,12 @@ public:
     // -----------------------------------------------------------------------
     // diagnostics
     // -----------------------------------------------------------------------
+
+    void SetTraceLevel(int traceLevel)
+    {
+        m_environment->traceLevel = traceLevel;
+    }
+    int TraceLevel() const { return m_environment->traceLevel; }
 
     // call EnableNodeTracing() on the given nodes for real, category, and sparse printing
     void EnableNodeTracing(const std::vector<std::wstring>& traceNodeNamesReal,
@@ -829,7 +974,7 @@ private:
 
 public:
     void DescribeNetworkUsingDot(std::list<ComputationArc>& arcs, std::wstring outFile);
-    void PlotNetworkTopology(const std::wstring outputFile);
+    void PlotNetworkTopology(const std::wstring& outputFile);
 
     // -----------------------------------------------------------------------
     // scripting integration
@@ -964,7 +1109,7 @@ public:
     // data members
     // -----------------------------------------------------------------------
 
-    unsigned long GetRandomSeedOffset()
+    unsigned long GetRandomSeedOffset() const
     {
         return m_randomSeedOffset;
     }
@@ -1000,6 +1145,9 @@ private:
 
     // environment information that nodes may want to inquire, e.g. to know whether we are training
     ComputationEnvironmentPtr m_environment;
+
+    std::map<std::wstring, std::vector<ComputationNodeBasePtr>> m_namedCriterionNodes;
+
 private:
     // -----------------------------------------------------------------------
     // the following members are all result of post-processing by CompileNetwork()

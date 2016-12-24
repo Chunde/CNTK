@@ -4,6 +4,9 @@
 //
 
 #include "stdafx.h"
+#define __STDC_FORMAT_MACROS
+#include <inttypes.h>
+#include <limits>
 #include "TextConfigHelper.h"
 #include "DataReader.h"
 #include "StringUtil.h"
@@ -14,20 +17,22 @@ using std::pair;
 using std::vector;
 using std::map;
 
+#undef max // max is defined in minwindef.h
+
 namespace Microsoft { namespace MSR { namespace CNTK {
 
 TextConfigHelper::TextConfigHelper(const ConfigParameters& config)
 {
     if (!config.ExistsCurrent(L"input"))
     {
-        RuntimeError("CNTKTextFormatReader configuration does not contain input section");
+        RuntimeError("CNTKTextFormatReader configuration does not contain \"input\" section.");
     }
 
     const ConfigParameters& input = config(L"input");
 
     if (input.empty())
     {
-        RuntimeError("CNTKTextFormatReader configuration contains an empty input section");
+        RuntimeError("CNTKTextFormatReader configuration contains an empty \"input\" section.");
     }
 
     string precision = config.Find("precision", "float");
@@ -48,10 +53,10 @@ TextConfigHelper::TextConfigHelper(const ConfigParameters& config)
     map<string, wstring> aliasToInputMap;
     for (const pair<string, ConfigParameters>& section : input)
     {
-        ConfigParameters input = section.second;
+        ConfigParameters input2 = section.second;
         wstring name = msra::strfun::utf16(section.first);
 
-        if (!input.ExistsCurrent(L"dim") || !input.ExistsCurrent(L"format"))
+        if (!input2.ExistsCurrent(L"dim") || !input2.ExistsCurrent(L"format"))
         {
             RuntimeError("Input section for input '%ls' does not specify all the required parameters, "
                 "\"dim\" and \"format\".", name.c_str());
@@ -60,8 +65,8 @@ TextConfigHelper::TextConfigHelper(const ConfigParameters& config)
         StreamDescriptor stream;
         stream.m_id = id++;
         stream.m_name = name;
-        stream.m_sampleDimension = input(L"dim");
-        string type = input(L"format");
+        stream.m_sampleDimension = input2(L"dim");
+        string type = input2(L"format");
 
         if (AreEqualIgnoreCase(type, "dense"))
         {
@@ -70,19 +75,25 @@ TextConfigHelper::TextConfigHelper(const ConfigParameters& config)
         else if (AreEqualIgnoreCase(type, "sparse"))
         {
             stream.m_storageType = StorageType::sparse_csc;
+            if (stream.m_sampleDimension > numeric_limits<IndexType>::max())
+            {
+                RuntimeError("Sample dimension (%" PRIu64 ") for sparse input '%ls'"
+                    " exceeds the maximum allowed value (%" PRIu64 ").\n",
+                    stream.m_sampleDimension, name.c_str(), (size_t)numeric_limits<IndexType>::max());
+            }
         }
         else
         {
-            RuntimeError("'format' parameter must be set either to 'dense' or 'sparse'");
+            RuntimeError("'format' parameter must be set either to 'dense' or 'sparse'.");
         }
 
         // alias is optional
-        if (input.ExistsCurrent(L"alias"))
+        if (input2.ExistsCurrent(L"alias"))
         {
-            stream.m_alias = input(L"alias");
+            stream.m_alias = input2(L"alias");
             if (stream.m_alias.empty())
             {
-                RuntimeError("Alias value for input '%ls' is empty", name.c_str());
+                RuntimeError("Alias value for input '%ls' is empty.", name.c_str());
             }
         }
         else
@@ -106,32 +117,38 @@ TextConfigHelper::TextConfigHelper(const ConfigParameters& config)
 
     m_filepath = msra::strfun::utf16(config(L"file"));
 
-    if (config.Exists(L"randomize"))
+    wstring randomizeString = config(L"randomize", wstring());
+    if (!_wcsicmp(randomizeString.c_str(), L"none")) // TODO: don't support case-insensitive option strings in the new reader
     {
-        wstring randomizeString = config.CanBeString(L"randomize") ? config(L"randomize") : wstring();
-        if (!_wcsicmp(randomizeString.c_str(), L"none"))
-        {
-            m_randomizationWindow = randomizeNone;
-        }
-        else if (!_wcsicmp(randomizeString.c_str(), L"auto"))
-        {
-            m_randomizationWindow = randomizeAuto;
-        }
-        else
-        {
-            m_randomizationWindow = config(L"randomize");
-        }
+        // "none" is only accepted to be backwards-compatible (DoWriteOutput() in EvalActions.cpp
+        // inserts this magic constant into the reader config to prevent it from shuffling the input).
+        // In user-defined configurations, 'randomize' should be a boolean.
+        m_randomizationWindow = randomizeNone;
     }
     else
     {
-        m_randomizationWindow = randomizeAuto;
+        bool randomize = config(L"randomize", true);
+
+        if (!randomize)
+        {
+            m_randomizationWindow = randomizeNone;
+        }
+        else if (config.Exists(L"randomizationWindow"))
+        {
+            m_randomizationWindow = config(L"randomizationWindow");
+        }
+        else
+        {
+            m_randomizationWindow = randomizeAuto;
+        }
     }
 
     m_skipSequenceIds = config(L"skipSequenceIds", false);
     m_maxErrors = config(L"maxErrors", 0);
-    m_traceLevel = config(L"traceLevel", 0);
+    m_traceLevel = config(L"traceLevel", 1);
     m_chunkSizeBytes = config(L"chunkSizeInBytes", 32 * 1024 * 1024); // 32 MB by default
-    m_chunkCacheSize = config(L"numChunksToCache", 32); // 32 * 32 MB = 1 GB of memory in total
+    m_keepDataInMemory = config(L"keepDataInMemory", false);
+    m_frameMode = config(L"frameMode", false);
 }
 
 }}}

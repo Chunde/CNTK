@@ -106,27 +106,49 @@ fi
 
 # Dependency files
 
-# ACML
-declare -a acmlFiles=("libacml_mp.so" "libiomp5.so")
+# MKL
+declare -a mklFiles=("libmkl_cntk_p.so" "libiomp5.so")
 
 # Open CV
-declare -a opencvFiles=("libopencv_core.so.3.0" "libopencv_imgproc.so.3.0" "libopencv_imgproc.so.3.0" "libopencv_imgcodecs.so.3.0")
+declare -a opencvFiles=("libopencv_core.so.3.1" "libopencv_imgproc.so.3.1" "libopencv_imgproc.so.3.1" "libopencv_imgcodecs.so.3.1")
 
 # libzip
-declare -a libzipFiles=("libzip.so")
+declare -a libzipFiles=("libzip.so.4")
 
 # CUDA
-declare -a cudaFiles=("libcudart.so.7.0" "libcublas.so.7.0" "libcurand.so.7.0" "libcusparse.so.7.0")
+declare -a cudaFiles=("libcudart.so.8.0" "libcublas.so.8.0" "libcurand.so.8.0" "libcusparse.so.8.0")
 
 # cuDNN
-declare -a cudnnFiles=("libcudnn.so.4")
+# Note: can be only a single file currently, see copy below.
+declare -a cudnnFiles=("libcudnn.so")
+
+# OpenBLAS (Needed by Kaldi)
+declare -a openblasFiles=("libopenblas.so.0")
+
+# Kaldi
+declare -a kaldiFiles=("libkaldi-util.so" "libkaldi-matrix.so" "libkaldi-base.so" "libkaldi-hmm.so" "libkaldi-cudamatrix.so" "libkaldi-nnet.so" "libkaldi-lat.so" "libkaldi-tree.so")
+
+# OpenFst (from Kaldi)
+declare -a openfstFiles=("libfst.so.3")
+
+# Include files
+declare -a includeFiles=("Eval.h")
+
+# Include files 2.0
+declare -a includeFiles20=("CNTKLibrary.h" "CNTKLibraryInternals.h")
 
 # Set dependency sources paths
-acmlPath="/usr/local/acml5.3.1/ifort64_mp/lib"
-opencvPath="/usr/local/opencv-3.0.0/lib"
+mklVersion="2"
+mklPath="/usr/local/CNTKCustomMKL/$mklVersion/x64/parallel"
+opencvVersion="3.1.0"
+opencvPath="/usr/local/opencv-$opencvVersion/lib"
 libzipPath="/usr/local/lib"
 cudaPath="/usr/local/cuda/lib64"
-cudnnPath="/usr/local/cudnn-4.0/cuda/lib64"
+cudnnPath="/usr/local/cuda/lib64"
+openblasPath="/usr/local/openblas/lib"
+kaldiVersion="c024e8aa"
+kaldiPath="/usr/local/kaldi-$kaldiVersion/src/lib"
+openfstPath="/usr/local/kaldi-$kaldiVersion/tools/openfst/lib"
 
 # Set build paths
 buildPath="build/$targetConfig/release"
@@ -134,6 +156,9 @@ basePath="BinaryDrops"
 baseDropPath="$basePath/cntk"
 baseBinariesPath="$baseDropPath/cntk"
 baseDependenciesPath="$baseBinariesPath/dependencies/lib"
+baseIncludePath="$baseDropPath/Include"
+includePath="Source/Common/Include"
+includePath20="Source/CNTKv2LibraryDll/API"
 extrasPath="Tools/cntk-binary-drop/linux/$targetConfig"
 gzipFile="BinaryDrops.tar.gz"
 
@@ -143,10 +168,49 @@ mkdir -p $baseBinariesPath
 # Copy build binaries
 echo "Copying build binaries..." >&3
 cp -r $buildPath/* $baseBinariesPath
+# Remove unnessesary file(s) if exist(s)
+#
+# General TODO: Implement White List of Binary Drop contents.
+# For the time being "cherry pick"  removal of unneeded files
+#
+# Remove Py 2.7 for the time being
+rm -f $baseBinariesPath/python/cntk*27*27*.whl
+rm -f $baseBinariesPath/bin/brainscripttests
+rm -f $baseBinariesPath/bin/cppevalclient
+rm -f $baseBinariesPath/bin/cppevalextendedclient
+rm -f $baseBinariesPath/bin/cppevalv2client
+rm -f $baseBinariesPath/bin/evaltests
+rm -f $baseBinariesPath/bin/mathtests
+rm -f $baseBinariesPath/bin/multiversotests
+rm -f $baseBinariesPath/bin/networktests
+rm -f $baseBinariesPath/bin/readertests
+rm -f $baseBinariesPath/bin/v2librarydistributiontests
+rm -f $baseBinariesPath/bin/v2librarytests
+
+# Make Include directory
+mkdir -p $baseIncludePath
+
+# Copy Include
+echo "Copying Include files..." >&3
+CopyFilesFromList $includePath includeFiles[@] $baseIncludePath 
+echo "Copying Include files for Version 2..." >&3
+CopyFilesFromList $includePath20 includeFiles20[@] $baseIncludePath 
 
 # Copy Examples
 echo "Copying Examples..." >&3
 cp -r Examples $baseDropPath
+# Include CPPEvalV2Client examples in 2.0 Beta drop
+# rm -rf $baseDropPath/Examples/Evaluation/CPPEvalV2Client
+
+# Copy Tutorials
+echo "Copying Tutorials..." >&3
+cp -r Tutorials $baseDropPath
+
+# Copy Scripts (Scripts folder from the root of the Repo)
+echo "Copying Scripts..." >&3
+cp -r Scripts $baseDropPath
+# Remove test related file(s) if exist(s)
+rm -f $baseDropPath/Scripts/pytest.ini
 
 # Copy Extras
 echo "Copying Extras..." >&3
@@ -158,9 +222,9 @@ echo "Copying Dependencies..." >&3
 # Make dependencies directory
 mkdir -p $baseDependenciesPath
 
-# Copy ACML
-echo "Copying ACML..." >&3
-CopyFilesFromList $acmlPath acmlFiles[@] $baseDependenciesPath
+# Copy MKL
+echo "Copying MKL" >&3
+CopyFilesFromList $mklPath mklFiles[@] $baseDependenciesPath
 
 # Copy Open CV
 echo "Copying Open CV..." >&3
@@ -169,6 +233,18 @@ CopyFilesFromList $opencvPath opencvFiles[@] $baseDependenciesPath
 # Copy libzip
 echo "Copying libzip..." >&3
 CopyFilesFromList $libzipPath libzipFiles[@] $baseDependenciesPath
+
+# Copy OpenBLAS (for Kaldi)
+echo "Copying OpenBLAS (for Kaldi)..." >&3
+CopyFilesFromList $openblasPath openblasFiles[@] $baseDependenciesPath
+
+# Copy Kaldi
+echo "Copying Kaldi..." >&3
+CopyFilesFromList $kaldiPath kaldiFiles[@] $baseDependenciesPath
+
+# Copy OpenFst (from Kaldi)
+echo "Copying OpenFst (Kaldi)..." >&3
+CopyFilesFromList $openfstPath openfstFiles[@] $baseDependenciesPath
 
 # GPU Drops only
 if [[ $targetConfig != "cpu" ]]; then
@@ -179,7 +255,7 @@ if [[ $targetConfig != "cpu" ]]; then
 
     # Copy cuDNN
     echo "Copying cuDNN..." >&3
-    CopyFilesFromList $cudnnPath cudnnFiles[@] $baseDependenciesPath
+    CopyFilesFromList $cudnnPath cudnnFiles[@] $baseDependenciesPath/libcudnn.so.5
 
 fi
 

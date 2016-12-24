@@ -14,18 +14,20 @@ class FramePacker : public SequencePacker
 {
 public:
     FramePacker(
-        MemoryProviderPtr memoryProvider,
-        TransformerPtr transformer,
-        size_t minibatchSize,
-        const std::vector<StreamDescriptionPtr>& streams) :
-        SequencePacker(memoryProvider, transformer, minibatchSize, streams)
-    {
+        SequenceEnumeratorPtr sequenceEnumerator,
+        const std::vector<StreamDescriptionPtr>& streams,
+        bool useLocalTimeline = false,
+        size_t numberOfBuffers = 2) :
+        SequencePacker(sequenceEnumerator, streams, numberOfBuffers), m_useLocalTimeline(useLocalTimeline)
+    {}
 
-    }
+protected:
+    MBLayoutPtr CreateMBLayout(const StreamBatch& batch) override;
+
+    Sequences GetNextSequences() override;
 
 private:
-
-    MBLayoutPtr CreateMBLayout(const StreamBatch& batch) override;
+    bool m_useLocalTimeline;
 };
 
 typedef std::shared_ptr<FramePacker> FramePackerPtr;

@@ -14,7 +14,7 @@
 #include <vld.h> // leak detection
 #endif
 #include <fstream>
-#include <random> // std::default_random_engine
+#include <random>
 #include "fileutil.h"
 
 namespace Microsoft { namespace MSR { namespace CNTK {
@@ -674,6 +674,9 @@ bool BatchLUSequenceReader<ElemType>::EnsureDataAvailable(size_t /*mbStartSample
             {
                 unsigned seed = this->m_seed;
                 std::shuffle(m_parser.mSentenceIndex2SentenceInfo.begin(), m_parser.mSentenceIndex2SentenceInfo.end(), std::default_random_engine(seed));
+                // ToDo: move to different random generator MT (?), move to boost::random_shuffle(?)
+                // std::mt19937_64 rng(seed);
+                // Microsoft::MSR::CNTK::RandomShuffleMT(m_parser.mSentenceIndex2SentenceInfo, rng);
                 this->m_seed++;
             }
 #endif
@@ -796,7 +799,7 @@ bool BatchLUSequenceReader<ElemType>::EnsureDataAvailable(size_t /*mbStartSample
 }
 
 template <class ElemType>
-size_t BatchLUSequenceReader<ElemType>::GetNumParallelSequences()
+size_t BatchLUSequenceReader<ElemType>::GetNumParallelSequencesForFixingBPTTMode()
 {
 #if 1
     return m_pMBLayout->GetNumParallelSequences(); // (this function is only used for validation anyway)
@@ -817,7 +820,7 @@ void BatchLUSequenceReader<ElemType>::SetNumParallelSequences(const size_t mz)
 }
 
 template <class ElemType>
-bool BatchLUSequenceReader<ElemType>::GetMinibatch(StreamMinibatchInputs& matrices)
+bool BatchLUSequenceReader<ElemType>::TryGetMinibatch(StreamMinibatchInputs& matrices)
 {
     // get out if they didn't call StartMinibatchLoop() first
     // TODO: Why is this allowed? Why not terminate?
@@ -881,12 +884,12 @@ bool BatchLUSequenceReader<ElemType>::GetMinibatch(StreamMinibatchInputs& matric
                     {
                         assert(idx == (LabelIdType) NULLLABEL); // TODO: what other conditions?
                         // if (!m_pMBLayout->IsGap(s, t))    // verify that these are marked as NoInput
-                        //    LogicError("BatchLUSequenceReader::GetMinibatch observation is larger than its dimension but no_labels sign is not used to indicate that this observation has no labels. Possible reason is a bug in EnsureDataAvailable or a bug here.");
+                        //    LogicError("BatchLUSequenceReader::TryGetMinibatch observation is larger than its dimension but no_labels sign is not used to indicate that this observation has no labels. Possible reason is a bug in EnsureDataAvailable or a bug here.");
                         continue;
                     }
 
                     // if (m_pMBLayout->IsGap(s, t))    // verify that these are marked as NoInput
-                    //    LogicError("BatchLUSequenceReader::GetMinibatch: Inconsistent NoInput flag");
+                    //    LogicError("BatchLUSequenceReader::TryGetMinibatch: Inconsistent NoInput flag");
 
                     locObs.SetValue(idx + jj * featInfo.dim, j, (ElemType) 1);
                 }
@@ -1087,9 +1090,9 @@ bool BatchLUSequenceReader<ElemType>::GetFrame(StreamMinibatchInputs& matrices, 
                 assert((jj == m_wordContext.size() - 1) ? true : cxt > m_wordContext[jj + 1]);
 
                 size_t hidx;
-                size_t hlength = history.size();
-                if (hlength + cxt > 0)
-                    hidx = history[hlength + cxt - 1];
+                size_t hlength2 = history.size();
+                if (hlength2 + cxt > 0)
+                    hidx = history[hlength2 + cxt - 1];
                 else
                     hidx = history[0];
 
@@ -1171,10 +1174,9 @@ template class BatchLUSequenceReader<double>;
 template class BatchLUSequenceReader<float>;
 
 template <class ElemType>
-bool MultiIOBatchLUSequenceReader<ElemType>::GetMinibatch(StreamMinibatchInputs& matrices)
+bool MultiIOBatchLUSequenceReader<ElemType>::TryGetMinibatch(StreamMinibatchInputs& matrices)
 {
     // on first iteration, need to check if all requested data matrices are available
-    std::map<std::wstring, size_t>::iterator iter;
     if (mCheckDictionaryKeys)
     {
         for (auto iter = matrices.begin(); iter != matrices.end(); iter++) // TODO: range-based for
@@ -1287,9 +1289,9 @@ void MultiIOBatchLUSequenceReader<ElemType>::CopyMBLayoutTo(MBLayoutPtr pMBLayou
 }
 
 template <class ElemType>
-size_t MultiIOBatchLUSequenceReader<ElemType>::GetNumParallelSequences()
+size_t MultiIOBatchLUSequenceReader<ElemType>::GetNumParallelSequencesForFixingBPTTMode()
 {
-    return mReader.begin()->second->GetNumParallelSequences();
+    return mReader.begin()->second->GetNumParallelSequencesForFixingBPTTMode();
 }
 
 #if 0

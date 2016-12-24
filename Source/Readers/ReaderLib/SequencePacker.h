@@ -15,14 +15,11 @@ class SequencePacker : public PackerBase
 {
 public:
     SequencePacker(
-        MemoryProviderPtr memoryProvider,
-        TransformerPtr transformer,
-        size_t minibatchSize,
-        const std::vector<StreamDescriptionPtr>& streams) :
-        PackerBase(memoryProvider, transformer, minibatchSize, streams)
-    {
-
-    }
+        SequenceEnumeratorPtr sequenceEnumerator,
+        const std::vector<StreamDescriptionPtr>& streams,
+        size_t numberOfBuffers = 2) :
+        PackerBase(sequenceEnumerator, streams, numberOfBuffers)
+    {}
 
     virtual Minibatch ReadMinibatch() override;
 
@@ -34,6 +31,9 @@ protected:
     // Given a number of sequences, creates an MB layout that is used to guide
     // the actual packing.
     virtual MBLayoutPtr CreateMBLayout(const StreamBatch& batch);
+
+    // Helper function to check the sample shape of input samples.
+    void CheckSampleShape(const std::vector<SequenceDataPtr>& minibatch, StreamDescriptionPtr outputStream);
 };
 
 typedef std::shared_ptr<SequencePacker> SequencePackerPtr;

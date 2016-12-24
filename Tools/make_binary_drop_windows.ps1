@@ -48,12 +48,20 @@ If ($buildConfig -ne "Release")
 # Set Paths
 $basePath = "BinaryDrops\ToZip"
 $baseDropPath = Join-Path $basePath -ChildPath cntk
+$baseIncludePath = Join-Path $baseDropPath -ChildPath Include
 $zipFile = "BinaryDrops\BinaryDrops.zip"
 $buildPath = "x64\Release"
 If ($targetConfig -eq "CPU")
 {
 	$buildPath = "x64\Release_CpuOnly"
 }
+# Include Files
+$includePath = "Source\Common\Include"
+$includePath20 = "Source\CNTKv2LibraryDll\API"
+$includeFiles = New-Object string[] 3
+$includeFiles[0] = Join-Path $includePath -ChildPath Eval.h
+$includeFiles[1] = Join-Path $includePath20 -ChildPath CNTKLibrary.h
+$includeFiles[2] = Join-Path $includePath20 -ChildPath CNTKLibraryInternals.h
 $sharePath = Join-Path $sharePath -ChildPath $targetConfig
 
 
@@ -65,24 +73,70 @@ Write-Verbose "Copying build binaries ..."
 Copy-Item $buildPath -Recurse -Destination $baseDropPath\cntk
 
 # Clean unwanted items
-If (Test-Path $baseDropPath\cntk\UnitTests)
-{
-	Remove-Item $baseDropPath\cntk\UnitTests -Recurse
-}
 Remove-Item $baseDropPath\cntk\*test*.exe
 Remove-Item $baseDropPath\cntk\*.pdb
-Remove-Item $baseDropPath\cntk\*.lib
+# Keep EvalDll.lib
+Remove-Item $baseDropPath\cntk\*.lib  -Exclude EvalDll.lib, CNTKLibrary-2.0.lib
 Remove-Item $baseDropPath\cntk\*.exp
 Remove-Item $baseDropPath\cntk\*.metagen
+# Remove specific items
+If (Test-Path $baseDropPath\cntk\Python\cntk-*-cp27*.whl)
+{
+	Remove-Item $baseDropPath\cntk\Python\cntk-*-cp27*.whl
+}
+If (Test-Path $baseDropPath\cntk\CPPEvalClientTest.exe)
+{
+	Remove-Item $baseDropPath\cntk\CPPEvalClientTest.exe
+}
+If (Test-Path $baseDropPath\cntk\CSEvalClientTest.exe)
+{
+	Remove-Item $baseDropPath\cntk\CSEvalClientTest.exe
+}
+If (Test-Path $baseDropPath\cntk\CSEvalClientTest.exe.config)
+{
+	Remove-Item $baseDropPath\cntk\CSEvalClientTest.exe.config
+}
+If (Test-Path $baseDropPath\cntk\CommandEval.exe)
+{
+	Remove-Item $baseDropPath\cntk\CommandEval.exe
+}
+
+# Make Include folder
+New-Item -Path $baseIncludePath -ItemType directory
+
+# Copy Include
+Write-Verbose "Copying Include files ..."
+Foreach ($includeFile in $includeFiles)
+{
+	Copy-Item $includeFile -Destination $baseIncludePath
+}
 
 # Copy Examples
 Write-Verbose "Copying Examples ..."
 Copy-Item Examples -Recurse -Destination $baseDropPath\Examples
+# Include CPPEvalV2Client examples in 2.0 Beta drop
+# If (Test-Path $baseDropPath\Examples\Evaluation\CPPEvalV2Client)
+# {
+# 	Remove-Item $baseDropPath\Examples\Evaluation\CPPEvalV2Client -Recurse
+# }
+
+# Copy Examples
+Write-Verbose "Copying Tutorials ..."
+Copy-Item Tutorials -Recurse -Destination $baseDropPath\Tutorials
+
+# Copy Scripts
+Write-Verbose "Copying Scripts ..."
+Copy-Item Scripts -Recurse -Destination $baseDropPath\Scripts
+# Remove test related file(s) if exist(s)
+If (Test-Path $baseDropPath\Scripts\pytest.ini)
+{
+	Remove-Item $baseDropPath\Scripts\pytest.ini
+}
 
 # Copy all items from the share
 # For whatever reason Copy-Item in the line below does not work
 # Copy-Item $sharePath"\*"  -Recurse -Destination $baseDropPath
-# Copying with Robocopy. Maximum 2 retries, 30 sec waiting times in between
+# Copying with Robocopy. Maximum 2 retries, 30 sec waiting time in between
 Write-Verbose "Copying dependencies and other files from Remote Share ..."
 robocopy $sharePath $baseDropPath /s /e /r:2 /w:30
 # Check that Robocopy finished OK.

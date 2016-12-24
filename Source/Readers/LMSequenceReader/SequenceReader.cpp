@@ -660,7 +660,7 @@ void SequenceReader<ElemType>::ReadClassInfo(const wstring& vocfile, int& classS
 
     // check if unk is the same used in vocabulary file
     if (word4idx.find(mUnk.c_str()) == word4idx.end())
-        RuntimeError("ReadClassInfo unknown symbol '%s' is not in vocabulary file.", mUnk.c_str());
+        fprintf(stderr, "ReadClassInfo: 'unknown' symbol unk='%s' is not in vocabulary file. Unknown words will error out if encountered.\n", mUnk.c_str());
 }
 
 // InitCache - Initialize the caching reader if cache files exist, otherwise the writer
@@ -983,7 +983,7 @@ bool SequenceReader<ElemType>::SentenceEnd()
 /// the fourth row is the ending index + 1 of the class for this word
 template <class ElemType>
 void SequenceReader<ElemType>::GetLabelOutput(StreamMinibatchInputs& matrices,
-                                              size_t m_mbStartSample, size_t actualmbsize)
+                                              size_t mbStartSample, size_t actualmbsize)
 {
     FailBecauseDeprecated(__FUNCTION__);    // DEPRECATED CLASS, SHOULD NOT BE USED ANYMORE
 
@@ -1000,7 +1000,7 @@ void SequenceReader<ElemType>::GetLabelOutput(StreamMinibatchInputs& matrices,
     else if (readerMode == ReaderMode::Softmax)
         labels.Resize(1, actualmbsize);
 
-    for (size_t jSample = m_mbStartSample; j < actualmbsize; ++j, ++jSample)
+    for (size_t jSample = mbStartSample; j < actualmbsize; ++j, ++jSample)
     {
         // pick the right sample with randomization if desired
         size_t jRand = jSample;
@@ -1138,7 +1138,7 @@ void SequenceReader<ElemType>::GetClassInfo()
 }
 
 template <class ElemType>
-bool SequenceReader<ElemType>::GetMinibatch(StreamMinibatchInputs& matrices)
+bool SequenceReader<ElemType>::TryGetMinibatch(StreamMinibatchInputs& matrices)
 {
     FailBecauseDeprecated(__FUNCTION__);    // DEPRECATED CLASS, SHOULD NOT BE USED ANYMORE
 
@@ -1849,20 +1849,20 @@ bool BatchSequenceReader<ElemType>::GetMinibatchData(size_t& /*out*/ firstPosInS
             // generate the output label token
             if (labelOut.type != labelNone)
             {
-                const auto& labelValue = m_labelTemp[pos];
+                const auto& labelValue2 = m_labelTemp[pos];
                 LabelIdType labelId;
                 if (labelOut.type == labelCategory)
                 {
                     pos++; // consume it   --TODO: value is not used after this
-                    labelId = GetIdFromLabel(labelValue, labelOut);
+                    labelId = GetIdFromLabel(labelValue2, labelOut);
                 }
                 else if (nextWord)
                 {
                     // this is the next word (pos was already incremented above when reading out labelValue)
-                    if (EqualCI(labelValue, labelIn.endSequence)) // end symbol may differ between input and output
+                    if (EqualCI(labelValue2, labelIn.endSequence)) // end symbol may differ between input and output
                         labelId = GetIdFromLabel(labelIn.endSequence, labelIn);
                     else
-                        labelId = GetIdFromLabel(labelValue, labelIn);
+                        labelId = GetIdFromLabel(labelValue2, labelIn);
                 }
                 else
                     LogicError("Unexpected output label type."); // should never get here
@@ -1889,7 +1889,7 @@ bool BatchSequenceReader<ElemType>::GetMinibatchData(size_t& /*out*/ firstPosInS
 //  - up to N sequences of the same length are returned in each MB
 //     - minibatches consist of sequences of the same length only (no gaps)
 template <class ElemType>
-bool BatchSequenceReader<ElemType>::GetMinibatch(StreamMinibatchInputs& matrices)
+bool BatchSequenceReader<ElemType>::TryGetMinibatch(StreamMinibatchInputs& matrices)
 {
     // get out if they didn't call StartMinibatchLoop() first
     // TODO: Why not fail here?
@@ -2023,7 +2023,7 @@ bool BatchSequenceReader<ElemType>::GetMinibatch(StreamMinibatchInputs& matrices
 timePos: the time position. for example, 100 actual minibatch with 10 streams,
 timePosition = [0,..,9] for each actual tiem
 */
-// This function was only called from BatchSequenceReader::GetMinibatch(), but no longer.
+// This function was only called from BatchSequenceReader::TryGetMinibatch(), but no longer.
 template <class ElemType>
 void BatchSequenceReader<ElemType>::SetSentenceBegin(int wrd, int uttPos, int timePos)
 {

@@ -14,9 +14,12 @@
 #endif
 
 #include "Basics.h"
+#include "basetypes.h"
 #include <string>
 #include <stdint.h>
 #include <memory>
+#include <unordered_map>
+#include <map>
 
 #pragma warning( disable: 4251 )
 typedef unsigned char byte;
@@ -38,7 +41,12 @@ typedef unsigned char byte;
 #define GPUSPARSE_INDEX_TYPE int // cuSparse only supports int array indexes
 #define CPUSPARSE_INDEX_TYPE int // to be consistent with cuSparse but limited the possible size of the matrix.
 
+#define MEM_MAX_LIMIT_TIMES 2 // The maximum times allowed a cached memory block allocated to a request
+
 namespace Microsoft { namespace MSR { namespace CNTK {
+
+MATH_API void SetMathLibTraceLevel(int traceLevel);
+MATH_API int GetMathLibTraceLevel();
 
 class MATH_API TracingGPUMemoryAllocator
 {
@@ -58,11 +66,13 @@ public:
     template <typename AllocatedElemType>
     static void Free(int deviceId, AllocatedElemType* bufferPtr, bool ignoreCUDARetCode = false);
 
+    // Let it be public method, the memory manager could check the totoal free memory and decide whether to physically
+    // release all the cached memory.
+    static std::pair<size_t, size_t> GetFreeAndTotalMemoryInMBs(int deviceId);
+
 private:
     template <typename AllocatedElemType>
     static AllocatedElemType* AllocateNoTrace(int deviceId, size_t numElements);
-
-    static std::pair<size_t, size_t> GetFreeAndTotalMemoryInMBs(int deviceId);
 };
 
 // -----------------------------------------------------------------------
@@ -73,29 +83,31 @@ private:
 enum ElementWiseOperator
 {
     // nullary
-    opConstOne,
+    opConstOne, opNone,
     // unary (or binary with constant parameter)
     opCopy,
-    opNegate, opNot, opAbs, opReciprocal,
+    opNegate, opNot, opAbs, opFloor, opReciprocal,
     opSigmoid, opTanh, opSqr, opSqrt, opExp, opLog, opLinearRectifier, opCosine, opSin,
     // unary ops for use by Matrix class only (there is no TensorView implementation)
     opSigmoidDerivative, opLinearRectifierDerivative, opNegativeSine,
     // binary
-    opSum, opDifference, opElementwiseProduct, opElementwiseQuotient, opLogSum,
+    opCopyIf, opCopyIfNot, opSum, opDifference, opElementwiseProduct, opElementwiseQuotient, opLogSum,
     opMax, opMin,
-    opLT, opEQ, opGT, opGE, opNE, opLE, // Note: must obey this order: (sgn(a-b) == -1, 0, +1), (sgn(a-b) != -1, 0, +1)
+    opLess, opEqual, opGreater, opGreaterEqual, opNotEqual, opLessEqual, // Note: must obey this order: (sgn(a-b) == -1, 0, +1), (sgn(a-b) != -1, 0, +1)
     opAnd, opOr, opXor, opMaskNegative,
     opElementwiseProductWithSigmoidDerivativeFromOutput, opElementwiseProductWithTanhDerivativeFromOutput,
     opElementwiseProductWithLinearRectifierDerivativeFromOutput, opElementwiseProductWithLogDerivativeFromOutput,
     opElementwiseProductWithCosDerivative, opElementwiseProductWithSinDerivative,
-    opElementwiseProductWithAbsDerivative, opElementwiseProductWithSqrtDerivative, 
+    opElementwiseProductWithAbsDerivative, opElementwiseProductWithSqrtDerivative,
     opElementwiseProductWithReciprocalDerivative, opSqrOfDifference,
     // binary ops for indexing
     // opIndex,
     // ternary
     opCond /*a ? b : c*/,
     opClip, /*clip a within interval b..c*/
-    opElementwiseProductWithLogSumDerivative
+    opElementwiseProductWithLogSumDerivative,
+    opCopyIfEqual,
+    opElementwiseProductWithExpOfDiff, /* a * exp(b - c) */
     // Note: not all that's implemented in CNTK ComputationNodes has an opcode yet.
 };
 
@@ -108,6 +120,7 @@ enum ElementWiseOperator
     Macro(Negate);            \
     Macro(Not);               \
     Macro(Abs);               \
+    Macro(Floor);             \
     Macro(Reciprocal);        \
     Macro(Sigmoid);           \
     Macro(Tanh);              \
@@ -120,6 +133,8 @@ enum ElementWiseOperator
     Macro(Sin);
 
 #define ForAllBinaryOps(Macro)                                        \
+    Macro(CopyIf);                                                    \
+    Macro(CopyIfNot);                                                 \
     Macro(Sum);                                                       \
     Macro(Difference);                                                \
     Macro(ElementwiseProduct);                                        \
@@ -127,12 +142,12 @@ enum ElementWiseOperator
     Macro(LogSum);                                                    \
     Macro(Max);                                                       \
     Macro(Min);                                                       \
-    Macro(EQ);                                                        \
-    Macro(NE);                                                        \
-    Macro(GT);                                                        \
-    Macro(LT);                                                        \
-    Macro(GE);                                                        \
-    Macro(LE);                                                        \
+    Macro(Equal);                                                     \
+    Macro(NotEqual);                                                  \
+    Macro(Greater);                                                   \
+    Macro(Less);                                                      \
+    Macro(GreaterEqual);                                              \
+    Macro(LessEqual);                                                 \
     Macro(And);                                                       \
     Macro(Or);                                                        \
     Macro(Xor);                                                       \
@@ -149,10 +164,12 @@ enum ElementWiseOperator
     Macro(SqrOfDifference);                                           \
     //Macro(Index);
 
-#define ForAllTernaryOps(Macro)                    \
-    Macro(Cond);                                   \
-    Macro(Clip);                                   \
-    Macro(ElementwiseProductWithLogSumDerivative);
+#define ForAllTernaryOps(Macro)                         \
+    Macro(Cond);                                        \
+    Macro(CopyIfEqual);                                 \
+    Macro(Clip);                                        \
+    Macro(ElementwiseProductWithLogSumDerivative);      \
+    Macro(ElementwiseProductWithExpOfDiff);
 
 // -----------------------------------------------------------------------
 // various enums to describe
@@ -194,6 +211,158 @@ enum MatrixFlags
     matrixFlagDontOwnBuffer = 1 << bitPosDontOwnBuffer,       // the matrix memory pointers are externally managed, don't allocate/free or attempt to copy to another location
     matrixFlagSetValueOnDevice = 1 << bitPosSetValueOnDevice, // SetValue() call has a buffer that is already on the device
 };
+
+
+// -----------------------------------------------------------------------
+// BufferManagement -- to control the allocation and release of memory
+// 
+// 1. The goal of buffer management
+// The best way to save memory is releasing memory right after no longer used in the rest of the mini-batch, which makes 
+// the extra cost on memory operation and slows down the speed. An option to solve that is building the static link between 
+// all nodes in pre-computing process and making memory re-use in the runtime, known as shared node value matrices in CNTK. 
+// The other option is using a buffer pool to take over the allocation and release request. Whereas the physical operation on 
+// memory, logical operation will make nearly no cost on allocation or release. Since the second option, achieved as 
+// BufferManagement below, could control all the memory operation, including some trivial ones, like the workspace in convolutions, 
+// and more flexible, allocating based on size and being easy to implement new algorithm, it is usually more powerful than the
+// first method.
+// 2. How it works?
+// First, it should be called in Resize function. In Resize function, using Request and LogicalReleaseFunction to replace the original 
+// request and release functions. Since BufferManagement is singleton for deviceId, just call the GetManagementInstance. And in Resize, 
+// there is a flag named growthOnly, which will request only the size increases to save the allocation cost. In the case, since the 
+// buffer pool, nearly no cost on allocation, the growth only will be disable in BufferManagement mode.
+// -----------------------------------------------------------------------
+class BufferManagement
+{
+private:
+    BufferManagement() = default;
+
+    // Disable all the copy & move functions to keep the instance safely
+    DISABLE_COPY_AND_MOVE(BufferManagement);
+
+public:
+    static BufferManagement& GetManagerInstance(DEVICEID_TYPE deviceId)
+    {
+        static std::mutex instancLock;
+        auto instance = m_instances.find(deviceId);
+        if (instance == m_instances.end()) 
+        {
+            std::lock_guard<std::mutex> lock(instancLock);
+            if (instance == m_instances.end())
+            {
+                instance = m_instances.insert(std::make_pair(deviceId, std::unique_ptr<BufferManagement>(
+                    new BufferManagement()))).first;
+                instance->second->m_deviceId = deviceId;
+                instance->second->m_totalManageSize = 0;
+                instance->second->m_totalAllocSize = 0;
+            }
+        }
+        return *(instance->second);
+    }
+
+    // for requesting, find in buffer container first, if failed, allocate a new one
+    // if allocating from buffer, the size will be modified to the real buffer size
+    template<class ElemType>
+    ElemType* RequestBuffer(size_t& size)
+    {
+        ElemType* bufferPtr = nullptr;
+        auto& bufferContainer = BufferContainer<ElemType>();
+
+        // simply allocating based on size, more efficient and complex algorithm could be implemented here
+        auto bufferHint = bufferContainer.lower_bound(size);
+        if (bufferHint != bufferContainer.end() && bufferHint->first < size * MEM_MAX_LIMIT_TIMES) 
+        {
+            bufferPtr = bufferHint->second;
+            size = bufferHint->first;
+            m_totalManageSize -= size;
+            bufferContainer.erase(bufferHint);
+            return bufferPtr;
+        }
+
+        if (m_deviceId >= 0) {
+#ifndef CPUONLY
+            auto deviceSize = TracingGPUMemoryAllocator::GetFreeAndTotalMemoryInMBs(m_deviceId);
+            float freeMemoryRatio = (float)deviceSize.first / deviceSize.second;
+            if (freeMemoryRatio < 0.05f || (deviceSize.first << 20) / sizeof(ElemType) < size) 
+            {
+                PhysicalReleaseAllBuffer<ElemType>();
+            }
+            bufferPtr = TracingGPUMemoryAllocator::Allocate<ElemType>(m_deviceId, size);
+            m_totalAllocSize += size;
+#endif
+        }
+        else 
+        {
+            // first, try no-throw allocation.
+            // if failed, empty the buffer and re-try a throwing allocation
+            // if failed again, let system throw the bad_alloc exception
+            bufferPtr = new (std::nothrow) ElemType[size];
+            if (!bufferPtr) 
+            {
+                PhysicalReleaseAllBuffer<ElemType>();
+                bufferPtr = new ElemType[size];
+            }
+            m_totalAllocSize += size;
+        }
+
+        return bufferPtr;
+    }
+
+    // insert the header of buffer into the buffer container
+    template<class ElemType>
+    void LogicalReleaseBuffer(ElemType* buffer, size_t size)
+    {
+        auto& bufferContainer = BufferContainer<ElemType>();
+        bufferContainer.insert(std::make_pair(size, buffer));
+        m_totalManageSize += size;
+    }
+
+    // physical release the buffer
+    template<class ElemType>
+    void PhysicalReleaseBuffer(ElemType* buffer)
+    {
+        if (m_deviceId >= 0) 
+        {
+#ifndef CPUONLY
+            TracingGPUMemoryAllocator::Free<ElemType>(m_deviceId, buffer, false);
+#endif
+        }
+        else {
+            delete[] buffer;
+        }
+    }
+
+    // empty all the cached buffer
+    template<class ElemType>
+    void PhysicalReleaseAllBuffer()
+    {
+        auto& bufferContainer = BufferContainer<ElemType>();
+
+        for (auto& iter : bufferContainer) 
+        {
+            PhysicalReleaseBuffer<ElemType>(iter.second);
+        }
+
+        bufferContainer.clear();
+        m_totalManageSize = 0;
+    }
+
+private:
+    static std::unordered_map<DEVICEID_TYPE, std::unique_ptr<BufferManagement>> m_instances;
+
+    template <class ElemType>
+    std::multimap<size_t, ElemType*>& BufferContainer();
+    DEVICEID_TYPE m_deviceId;
+    size_t m_totalManageSize;
+    size_t m_totalAllocSize;
+
+    // map to store all the temp buffer handle
+    std::multimap<size_t, float*> m_bufferFloatContainer;
+    std::multimap<size_t, double*> m_bufferDoubleContainer;
+    std::multimap<size_t, char*> m_bufferCharContainer;
+    std::multimap<size_t, short*> m_bufferShortContainer;
+    std::multimap<size_t, int*> m_bufferIntContainer;
+};
+
 
 // -----------------------------------------------------------------------
 // BaseMatrixStorage -- base class for all matrix types (CPU, GPU) x (dense, sparse)
@@ -252,9 +421,10 @@ public:
                     TracingGPUMemoryAllocator::Free<ElemType>(m_computeDevice, m_pArray, true);
                 m_pArray = nullptr;
 
-                if (m_rowToId != nullptr)
-                    TracingGPUMemoryAllocator::Free<GPUSPARSE_INDEX_TYPE>(m_computeDevice, m_rowToId, true);
-                m_rowToId = nullptr;
+                if (m_tempDeviceBuffer != nullptr)
+                    TracingGPUMemoryAllocator::Free<GPUSPARSE_INDEX_TYPE>(m_computeDevice, m_tempDeviceBuffer, true);
+                m_tempDeviceBuffer = nullptr;
+                m_tempDeviceBufferSize = 0;
 #endif
 
                 delete[](byte*) m_tempHostBuffer;
@@ -294,8 +464,17 @@ protected:
     size_t GetBlockSize() const { return m_blockSize; }
     void SetBlockSize(size_t blockSize) { m_blockSize = blockSize; }
 
-    GPUSPARSE_INDEX_TYPE* GetRowToIdMap() const { return m_rowToId; }
-    void SetRowToIdMap(GPUSPARSE_INDEX_TYPE* parray) { m_rowToId = parray; }
+    GPUSPARSE_INDEX_TYPE* GetTempDeviceBuffer() const { return m_tempDeviceBuffer; }
+    void ReserveTempDeviceBuffer(const size_t minSize) const
+    { 
+        BaseMatrixStorage<ElemType>* nonConstThis = const_cast<BaseMatrixStorage<ElemType>*>(this);
+        if (minSize > m_tempDeviceBufferSize)
+        {
+            TracingGPUMemoryAllocator::Free<GPUSPARSE_INDEX_TYPE>(GetComputeDeviceId(), nonConstThis->m_tempDeviceBuffer);
+            nonConstThis->m_tempDeviceBuffer = TracingGPUMemoryAllocator::Allocate<GPUSPARSE_INDEX_TYPE>(GetComputeDeviceId(), minSize);
+            nonConstThis->m_tempDeviceBufferSize = minSize;
+        }
+    }
 
     void* GetTempHostBuffer() const { return m_tempHostBuffer; }
     void SetTempHostBuffer(void* buffer) const { m_tempHostBuffer = buffer; }
@@ -324,59 +503,61 @@ protected:
     CPUSPARSE_INDEX_TYPE* GetCompIndex() const { return m_compIndex; }
     void SetCompIndex(CPUSPARSE_INDEX_TYPE* parray) { m_compIndex = parray; }
 
-	void ZeroInit(const MatrixFormat matrixFormat = matrixFormatDense, const DEVICEID_TYPE computeDevice = -1)
+    void ZeroInit(const MatrixFormat matrixFormat = matrixFormatDense, const DEVICEID_TYPE computeDevice = -1)
     {
         m_externalBuffer           = false;
         m_format                   = matrixFormat;
         m_computeDevice            = computeDevice;
-		m_numRows                  = 0;
-		m_numCols                  = 0;
-		m_pArray                   = nullptr;
-		m_elemSizeAllocated        = 0;
-		m_totalBufferSizeAllocated = 0;
-		m_blockSize                = 0; // block size
-		m_rowToId                  = nullptr; // the id showing the order row number is observed in the nnz values.
-		m_tempHostBuffer           = nullptr; // used to copy values.
-		m_tempHostBufferSize       = 0;
-		m_colIdx                   = 0; // used to SetValue()
-		m_compIndexSize            = 0;
-		m_nzValues                 = nullptr;
-		m_unCompIndex              = nullptr; // row/col ids in CSC/CSR format
-		m_compIndex                = nullptr; // begin ids of col/row in CSC/CSR format
-		m_blockIds                 = nullptr; // block ids
-		m_blockIdShift             = 0; // used to get efficient slice, actual col = blockIds[j] - m_blockIdShift
+        m_numRows                  = 0;
+        m_numCols                  = 0;
+        m_pArray                   = nullptr;
+        m_elemSizeAllocated        = 0;
+        m_totalBufferSizeAllocated = 0;
+        m_blockSize                = 0; // block size
+        m_tempDeviceBuffer         = nullptr;
+        m_tempDeviceBufferSize     = 0;
+        m_tempHostBuffer           = nullptr; // used to copy values.
+        m_tempHostBufferSize       = 0;
+        m_colIdx                   = 0; // used to SetValue()
+        m_compIndexSize            = 0;
+        m_nzValues                 = nullptr;
+        m_unCompIndex              = nullptr; // row/col ids in CSC/CSR format
+        m_compIndex                = nullptr; // begin ids of col/row in CSC/CSR format
+        m_blockIds                 = nullptr; // block ids
+        m_blockIdShift             = 0; // used to get efficient slice, actual col = blockIds[j] - m_blockIdShift
     }
 
 protected:
-	// **************************
-	// Variables requried by all matrices
-	// **************************
+    // **************************
+    // Variables requried by all matrices
+    // **************************
     MatrixFormat m_format;
     mutable DEVICEID_TYPE m_computeDevice; // current GPU device Id or CPUDEVICE
     bool m_externalBuffer; // is the buffer used by this matrix,
 
-	// m_numRows and m_numCols should be removed
+    // m_numRows and m_numCols should be removed
     size_t m_numRows;
     size_t m_numCols;
     size_t m_elemSizeAllocated;
     ElemType* m_pArray;
 
-	// **************************
-	// GPUSparseMatrix variables
-	// **************************
+    // **************************
+    // GPUSparseMatrix variables
+    // **************************
 
     size_t m_totalBufferSizeAllocated;
 
     // used by the blockCol and blockRow format
     size_t m_blockSize;                      // block size
-    mutable GPUSPARSE_INDEX_TYPE* m_rowToId; // the id showing the order row number is observed in the nnz values.
+    mutable GPUSPARSE_INDEX_TYPE* m_tempDeviceBuffer;
+    mutable size_t m_tempDeviceBufferSize;
 
     mutable void* m_tempHostBuffer; // used to copy values.
     mutable size_t m_tempHostBufferSize;
 
-	// **************************
-	// CPUSparseMatrix variables
-	// **************************
+    // **************************
+    // CPUSparseMatrix variables
+    // **************************
 
     int m_colIdx; // used to SetValue()
     size_t m_compIndexSize;
@@ -398,25 +579,37 @@ protected:
 template <class ElemType>
 class MATH_API BaseMatrix
 {
-public:
-    
-    BaseMatrix()
+protected:    
+    // Default constructor. Copy/Move constructors might set doNotInitialize to true to avoid double initialization.
+    BaseMatrix(bool doNotInitializeFields = false)
     {
-        ZeroInit();
+        if (!doNotInitializeFields)
+            ZeroInit();
     }
+
     virtual ~BaseMatrix()
     {
         ZeroValues();
     }
-
+public:
     void VerifyResizable(const char* function) const 
     { 
         if (!m_sob.unique())
             LogicError("%s: Cannot resize the matrix because it is a view.", function);
-        if (m_sob->HasExternalBuffer())
+        else if (m_sob->HasExternalBuffer())
             LogicError("%s: Cannot resize the matrix because it is externally owned.", function);
     }
-	// This is needed for Sparse Matrices to ensure they can write to the matrix. Note: writing to slices is not currently supported
+
+    // same as VerifyResizable() except for the error message. Could be folded into one.
+    void VerifyMigratable(const char* function) const
+    {
+        if (!m_sob.unique())
+            LogicError("%s: Cannot migrate the matrix between devices because it is a view.", function);
+        else if (m_sob->HasExternalBuffer())
+            LogicError("%s: Cannot migrate the matrix between devices because it is externally owned.", function);
+    }
+
+    // This is needed for Sparse Matrices to ensure they can write to the matrix. Note: writing to slices is not currently supported
     void VerifyWritable(const char* function) const 
     {
         if (!(m_sob->GetNumStorageRows() == m_numRows && m_sob->GetNumStorageCols() == m_numCols))
@@ -472,8 +665,8 @@ protected:
     size_t GetBlockSize() const { return m_sob->GetBlockSize(); }
     void SetBlockSize(size_t blockSize) { m_sob->SetBlockSize(blockSize); }
 
-    GPUSPARSE_INDEX_TYPE* GetRowToIdMap() const { return m_sob->GetRowToIdMap(); }
-    void SetRowToIdMap(GPUSPARSE_INDEX_TYPE* parray) { m_sob->SetRowToIdMap(parray); }
+    GPUSPARSE_INDEX_TYPE* GetTempDeviceBuffer() const { return m_sob->GetTempDeviceBuffer(); }
+    void ReserveTempDeviceBuffer(const size_t minSize) const { m_sob->ReserveTempDeviceBuffer(minSize); }
 
     void* GetTempHostBuffer() const { return m_sob->GetTempHostBuffer(); }
     void SetTempHostBuffer(void* buffer) const { m_sob->SetTempHostBuffer(buffer); };
@@ -528,10 +721,10 @@ protected:
         m_sliceViewOffset   = 0;
         m_sob               = nullptr;
     }
-	void ZeroInit(const MatrixFormat matrixFormat, const DEVICEID_TYPE computeDevice )
+    void ZeroInit(const MatrixFormat matrixFormat, const DEVICEID_TYPE computeDevice )
     {
         ZeroValues();
-		m_sob = make_shared<BaseMatrixStorage<ElemType>>(matrixFormat, computeDevice);
+        m_sob = make_shared<BaseMatrixStorage<ElemType>>(matrixFormat, computeDevice);
     }
 
 protected:
@@ -555,7 +748,7 @@ protected:
     // TODO: implement m_colStride
     size_t m_colStride;
 
-	// Storage OBject containing the underlying data used by this matrix
+    // Storage OBject containing the underlying data used by this matrix
     shared_ptr<BaseMatrixStorage<ElemType>> m_sob;
 };
 

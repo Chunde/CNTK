@@ -25,16 +25,14 @@ public:
     {}
 
     // Adds string value to the registry.
-    size_t AddValue(const TString& value)
+    void AddValue(const TString& value)
     {
-        assert(!Contains(value));
         auto iter = m_values.insert(std::make_pair(value, m_indexedValues.size()));
         m_indexedValues.push_back(&((iter.first)->first));
-        return m_indexedValues.size() - 1;
     }
 
     // Tries to get a value by id.
-    bool TryGet(const TString& value, size_t& id)
+    bool TryGet(const TString& value, size_t& id) const
     {
         const auto& it = m_values.find(value);
         if (it == m_values.end())
@@ -48,6 +46,18 @@ public:
         }
     }
 
+    // Get integer id for the string value, adding if not exists.
+    size_t operator[](const TString& value)
+    {
+        const auto& it = m_values.find(value);
+        if (it == m_values.end())
+        {
+            AddValue(value);
+            return m_values[value];
+        }
+        return it->second;
+    }
+
     // Get integer id for the string value.
     size_t operator[](const TString& value) const
     {
@@ -59,7 +69,8 @@ public:
     // Get string value by its integer id.
     const TString& operator[](size_t id) const
     {
-        assert(id < m_indexedValues.size());
+        if (id < m_indexedValues.size())
+            RuntimeError("Unknown id requested");
         return *m_indexedValues[id];
     }
 
